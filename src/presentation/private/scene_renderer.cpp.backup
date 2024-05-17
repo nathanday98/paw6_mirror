@@ -1,0 +1,811 @@
+#include "scene_renderer.h"
+
+#include <core/memory.h>
+#include <core/math.inl>
+#include <core/log.h>
+#include <core/allocators/arena_allocator.h>
+
+#include <platform/platform.h>
+
+#include "profiler.h"
+#include "gpu_profiler.h"
+#include "mesh.h"
+#include "renderer.h"
+#include "gpu.h"
+#include "gfx.h"
+#include "allocators/page_pool_allocator.h"
+
+#include <stb_image.h>
+
+#include "assets.h"
+
+struct SceneConstants
+{
+	Mat4 view_projection;
+};
+
+struct DebugGeomConstants
+{
+	Mat4 view_projecion;
+	u32 lines_buffer_slot;
+	Vec3 camera_position;
+};
+
+struct ModelPushConstants
+{
+	u32 object_constants_slot;
+	u32 scene_constants_slot;
+	u32 padding[2];
+};
+
+struct SkinPushConstants
+{
+	u32 in_vertex_buffer_slot;
+	u32 out_vertex_buffer_slot;
+	u32 bone_buffer_slot;
+	u32 vertex_count;
+	u32 pose_transform_count;
+	u32 pose_count;
+	u32 padding[2];
+};
+
+struct GuiConstants
+{
+	Mat4 projection;
+	u32 commands_buffer_index;
+	u32 sampler_index;
+	u32 padding[2];
+};
+
+static constexpr usize g_gui_command_buffer_count = 4096;
+
+void SceneRenderer::init(Platform& platform, usize init_width, usize init_height)
+{
+	width = init_width;
+	height = init_height;
+	createRenderTargets();
+
+	line_data.init();
+	no_depth_line_data.init();
+	gpu_line_data.init();
+
+	/*
+	pose_transforms_buffer = RenderUtils::createAndAllocateBuffer(
+		sizeof(Mat4) * render_poses.size * pose_transform_count,
+		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	pose_transforms_buffer_slot =
+		Gfx::pushBufferToShader(pose_transforms_buffer.buffer, 0, pose_transforms_buffer.size);
+	skinned_vertex_buffer = RenderUtils::createAndAllocateBuffer(
+		Assets::pedestrian_mesh.vertex_count * sizeof(StaticVertex) * render_poses.size,
+		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	skinned_vertex_buffer_slot = Gfx::pushBufferToShader(skinned_vertex_buffer.buffer, 0, skinned_vertex_buffer.size);
+
+	object_constants_staging = RenderUtils::createAndAllocateBuffer(
+		anim_instances.size * sizeof(ObjectConstants),
+		VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	object_constants_staging_ptr = reinterpret_cast<ObjectConstants*>(object_constants_staging.map());
+	*/
+	const usize single_gui_buffer_size = sizeof(GuiRectRenderCommand) * g_gui_command_buffer_count;
+	gui_commands_buffer = RenderUtils::createAndAllocateBuffer(
+		single_gui_buffer_size * Renderer::g_frames_in_flight,
+		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	gui_commands_buffer_ptr = reinterpret_cast<GuiRectRenderCommand*>(gui_commands_buffer.map());
+
+	for (usize local_frame_index = 0; local_frame_index < PAW_ARRAY_COUNT(frame_datas); local_frame_index++)
+	{
+		FrameData& frame_data = frame_datas[local_frame_index];
+		/*frame_data.object_constants_buffer = RenderUtils::createAndAllocateBuffer(
+			anim_instances.size * sizeof(ObjectConstants),
+			VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+				VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		frame_data.object_constants_buffer_slot = Gfx::pushBufferToShader(
+			frame_data.object_constants_buffer.buffer, 0, frame_data.object_constants_buffer.size);*/
+
+		frame_data.scene_constants_buffer = RenderUtils::createAndAllocateBuffer(
+			sizeof(SceneConstants),
+			VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		frame_data.scene_constants_buffer_slot = Gfx::pushBufferToShader(
+			frame_data.scene_constants_buffer.buffer, 0, frame_data.scene_constants_buffer.size);
+
+		frame_data.gui_commands_buffer_slot = Gfx::pushBufferToShader(
+			gui_commands_buffer.buffer, single_gui_buffer_size * local_frame_index, single_gui_buffer_size);
+	}
+
+	constexpr static VkSampleCountFlagBits sample_count = VK_SAMPLE_COUNT_4_BIT;
+
+	debug_pipeline = Gfx::createGraphicsPipeline(
+		platform,
+		"debug_geom"_str,
+		GraphicsPipelineDesc{
+			.name = "Debug Geom",
+			.blend_state = BlendStateDesc::alpha_blend,
+			.depth_test = true,
+			.depth_write = true,
+			.depth_compare_op = VK_COMPARE_OP_GREATER,
+			.color_format = VK_FORMAT_R8G8B8A8_SRGB,
+			.depth_format = Gpu::surfaceDepthFormat(),
+			.sample_count = sample_count,
+		});
+
+	debug_pipeline.verifyStruct<DebugGeomLine>("Line"_str);
+	debug_pipeline.verifyPushConstants<DebugGeomConstants>();
+
+	no_depth_debug_pipeline = Gfx::createGraphicsPipeline(
+		platform,
+		"debug_geom"_str,
+		GraphicsPipelineDesc{
+			.name = "Debug Geom No Depth",
+			.blend_state = BlendStateDesc::alpha_blend,
+			.depth_test = false,
+			.depth_write = false,
+			.depth_compare_op = VK_COMPARE_OP_GREATER,
+			.color_format = VK_FORMAT_R8G8B8A8_SRGB,
+			.depth_format = Gpu::surfaceDepthFormat(),
+			.sample_count = sample_count,
+		});
+
+	no_depth_debug_pipeline.verifyStruct<DebugGeomLine>("Line"_str);
+	no_depth_debug_pipeline.verifyPushConstants<DebugGeomConstants>();
+
+	gui_pipeline = Gfx::createGraphicsPipeline(
+		platform,
+		"gui"_str,
+		GraphicsPipelineDesc{
+			.name = "Gui",
+			.blend_state = BlendStateDesc::alpha_blend,
+			.depth_test = false,
+			.depth_write = false,
+			.color_format = VK_FORMAT_R8G8B8A8_SRGB,
+			.sample_count = sample_count,
+
+		});
+	gui_pipeline.verifyPushConstants<GuiConstants>();
+	gui_pipeline.verifyStruct<GuiRectRenderCommand>("GuiRectRenderCommand"_str);
+
+	model_pipeline = Gfx::createGraphicsPipeline(
+		platform,
+		"model"_str,
+		GraphicsPipelineDesc{
+			.name = "Model"_str,
+			.cull_mode = VK_CULL_MODE_BACK_BIT,
+			.blend_state = BlendStateDesc::alpha_blend,
+			.depth_test = true,
+			.depth_write = true,
+			.depth_compare_op = VK_COMPARE_OP_GREATER_OR_EQUAL,
+			.color_format = VK_FORMAT_R8G8B8A8_SRGB,
+			.depth_format = Gpu::surfaceDepthFormat(),
+			.sample_count = sample_count,
+		});
+
+	model_pipeline.verifyPushConstants<ModelPushConstants>();
+	model_pipeline.verifyStruct<SceneConstants>("SceneConstants"_str);
+	model_pipeline.verifyStruct<ObjectConstants>("ObjectConstants"_str);
+
+	skin_pipeline = Gfx::createComputePipeline(
+		platform,
+		"skin"_str,
+		ComputePipelineDesc{
+			.name = "Skin"_str,
+		});
+	skin_pipeline.verifyPushConstants<SkinPushConstants>();
+	skin_pipeline.verifyStruct<Mat4>("Bone"_str);
+	skin_pipeline.verifyStruct<StaticVertex>("StaticVertex"_str);
+	skin_pipeline.verifyStruct<SkinVertex>("InVertex"_str);
+
+	vector_pipeline = Gfx::createGraphicsPipeline(
+		platform,
+		"vector"_str,
+		GraphicsPipelineDesc{
+			.name = "Vector"_str,
+			.cull_mode = VK_CULL_MODE_NONE,
+			.blend_state = BlendStateDesc::alpha_blend,
+			.depth_test = false,
+			.depth_write = false,
+			.depth_compare_op = VK_COMPARE_OP_ALWAYS,
+			.color_format = VK_FORMAT_R8G8B8A8_SRGB,
+			.depth_format = Gpu::surfaceDepthFormat(),
+			.sample_count = sample_count,
+			// .alpha_to_coverage = true,
+			.sample_shading = true,
+		});
+
+	vector_pipeline.verifyPushConstants<VectorConstants>();
+	vector_pipeline.verifyStruct<SwfVertex>("Vertex"_str);
+
+	{
+		const VkSamplerCreateInfo create_info{
+			.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+			.magFilter = VK_FILTER_LINEAR,
+			.minFilter = VK_FILTER_LINEAR,
+			.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+			.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.mipLodBias = 0.0f,
+			.anisotropyEnable = VK_FALSE,
+			.compareEnable = VK_FALSE,
+			.compareOp = VK_COMPARE_OP_ALWAYS,
+			.minLod = 0.0f,
+			.maxLod = 0.0f,
+			.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+			.unnormalizedCoordinates = VK_FALSE,
+		};
+
+		VkResult result = vkCreateSampler(Gpu::device(), &create_info, 0, &font_sampler);
+		PAW_ASSERT(result == VK_SUCCESS);
+		PAW_ASSERT_UNUSED(result);
+
+		font_sampler_index = Gfx::pushSamplerToShader(font_sampler);
+	}
+
+	ArenaAllocator swf_allocator{};
+	swf_allocator.init(&g_page_pool_allocator, g_page_pool_allocator.page_size);
+
+	u64 start_tick_count = platform.getCpuTicks();
+	swf_shape = loadSwfFromMemory(
+		platform.DEBUG_loadFileBlocking("compiled_data/swfs/curve_test4.swf"_str, swf_allocator), swf_allocator);
+	PAW_LOG_INFO(
+		"Took %gms", ((f64)(platform.getCpuTicks() - start_tick_count) / (f64)platform.getTicksPerSecond()) * 1000.0);
+}
+
+void SceneRenderer::deinit()
+{
+	vkDeviceWaitIdle(Gpu::device());
+	destroyRenderTargets();
+	line_data.deinit();
+	no_depth_line_data.deinit();
+	gpu_line_data.deinit();
+}
+
+void SceneRenderer::beginFrame()
+{
+	line_data.reset();
+	no_depth_line_data.reset();
+
+	const usize local_frame_index = frame_index % Renderer::g_frames_in_flight;
+
+	render_command_count = 0;
+	render_commands = Slice<GuiRectRenderCommand>{
+		gui_commands_buffer_ptr + g_gui_command_buffer_count * local_frame_index,
+		g_gui_command_buffer_count,
+	};
+}
+
+void SceneRenderer::preRenderTick(RenderFrameData& render_frame_data)
+{
+	// FrameData& frame_data = frame_datas[frame_index % Renderer::g_frames_in_flight];
+	VkCommandBuffer command_buffer = render_frame_data.command_buffer;
+	PAW_GPU_PROFILER_ZONE("SceneRenderer", command_buffer);
+	gpu_line_data.reset(render_frame_data);
+
+	// VkDeviceAddress skinned_device_address = skinned_vertex_buffer.getDeviceAddress();
+
+	/*
+	for (usize i = 0; i < anim_instances.size; i++)
+	{
+		const AnimInstance& instance = anim_instances[i];
+		object_constants_staging_ptr[i].model = instance.transform.toMat4();
+		object_constants_staging_ptr[i].color = instance.color;
+		const usize start_ptr = reinterpret_cast<usize>(render_poses.ptr);
+		const usize instance_ptr = reinterpret_cast<usize>(instance.pose);
+		const usize item_size = sizeof(RenderPose);
+		const usize pose_index = (instance_ptr - start_ptr) / item_size;
+		object_constants_staging_ptr[i].vertex_buffer_slot = skinned_vertex_buffer_slot;
+		object_constants_staging_ptr[i].vertex_offset =
+			static_cast<u32>(pose_index * Assets::pedestrian_mesh.vertex_count * sizeof(StaticVertex));
+	}
+
+	{
+
+		const VkBufferCopy objects_copy{
+			.srcOffset = 0,
+			.dstOffset = 0,
+			.size = object_constants_staging.size,
+		};
+
+		vkCmdCopyBuffer(
+			command_buffer,
+			object_constants_staging.buffer,
+			frame_data.object_constants_buffer.buffer,
+			1,
+			&objects_copy);
+
+		const VkBufferMemoryBarrier barrier = Gfx::bufferBarrier(
+			frame_data.object_constants_buffer.buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+		vkCmdPipelineBarrier(
+			command_buffer,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+			0,
+			0,
+			nullptr,
+			1,
+			&barrier,
+			0,
+			nullptr);
+	}
+
+	Gpu::pushDebugGroup(command_buffer, "Skin");
+	{
+		PAW_GPU_PROFILER_ZONE("Skin", command_buffer);
+		Mat4* pose_ptr = reinterpret_cast<Mat4*>(pose_transforms_buffer.map());
+		for (usize i = 0; i < render_poses.size; i++)
+		{
+			memCopy(
+				render_poses[i].transforms.ptr,
+				&pose_ptr[i * pose_transform_count],
+				render_poses[i].transforms.calcTotalSizeInBytes());
+		}
+		pose_transforms_buffer.unmap();
+
+		const VkBufferMemoryBarrier read_barrier =
+			Gfx::bufferBarrier(skinned_vertex_buffer.buffer, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+		vkCmdPipelineBarrier(
+			command_buffer,
+			VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0,
+			0,
+			nullptr,
+			1,
+			&read_barrier,
+			0,
+			nullptr);
+
+		skin_pipeline.bind(command_buffer);
+
+		const SkinPushConstants constants{
+			.in_vertex_buffer_slot = Assets::pedestrian_mesh.vertex_buffer_slot,
+			.out_vertex_buffer_slot = skinned_vertex_buffer_slot,
+			.bone_buffer_slot = pose_transforms_buffer_slot,
+			.vertex_count = static_cast<u32>(Assets::pedestrian_mesh.vertex_count),
+			.pose_transform_count = static_cast<u32>(pose_transform_count),
+			.pose_count = static_cast<u32>(render_poses.size),
+		};
+
+		skin_pipeline.pushConstants(command_buffer, &constants);
+
+		vkCmdDispatch(
+			command_buffer,
+			static_cast<u32>(((Assets::pedestrian_mesh.vertex_count * render_poses.size) / 256) + 1),
+			1,
+			1);
+
+		const VkBufferMemoryBarrier write_barrier =
+			Gfx::bufferBarrier(skinned_vertex_buffer.buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+		vkCmdPipelineBarrier(
+			command_buffer,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+			0,
+			0,
+			nullptr,
+			1,
+			&write_barrier,
+			0,
+			nullptr);
+	}
+	Gpu::popDebugGroup(command_buffer);
+	*/
+}
+
+void SceneRenderer::beginRender(RenderFrameData& render_frame_data)
+{
+	FrameData& frame_data = frame_datas[frame_index % Renderer::g_frames_in_flight];
+	VkCommandBuffer command_buffer = render_frame_data.command_buffer;
+	{
+		const VkImageMemoryBarrier image_memory_barrier{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.image = frame_data.resolved_render_target.image,
+			.subresourceRange =
+				{
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.baseMipLevel = 0,
+					.levelCount = 1,
+					.baseArrayLayer = 0,
+					.layerCount = 1,
+				},
+		};
+
+		vkCmdPipelineBarrier(
+			command_buffer,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			0,
+			0,
+			nullptr,
+			0,
+			nullptr,
+			1,
+			&image_memory_barrier);
+	}
+
+	const VkRenderingAttachmentInfo color_attachment_info{
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = frame_data.render_target_view,
+		.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+		.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+		.resolveImageView = frame_data.resolved_render_target_view,
+		.resolveImageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.clearValue =
+			{
+				.color = {.float32 = {0.1f, 0.1f, 0.1f, 1.0f}},
+			},
+	};
+
+	const VkRenderingAttachmentInfo depth_attachment_info{
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = frame_data.depth_image_view,
+		.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		.clearValue =
+			{
+				.depthStencil = {.depth = 0.0f, .stencil = 0},
+			},
+	};
+
+	const VkRenderingInfo rendering_info{
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = {.offset = {0, 0}, .extent = {static_cast<u32>(width), static_cast<u32>(height)}},
+		.layerCount = 1,
+		.colorAttachmentCount = 1,
+		.pColorAttachments = &color_attachment_info,
+		.pDepthAttachment = &depth_attachment_info,
+	};
+
+	vkCmdBeginRendering(command_buffer, &rendering_info);
+
+	const VkViewport viewport{
+		.x = 0,
+		.y = static_cast<f32>(height),
+		.width = static_cast<f32>(width),
+		.height = -static_cast<f32>(height),
+		.minDepth = 0.0f,
+		.maxDepth = 1.0f,
+	};
+
+	vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+
+	const VkRect2D scissor{
+		.offset = {.x = 0, .y = 0},
+		.extent = rendering_info.renderArea.extent,
+	};
+
+	vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+}
+
+void SceneRenderer::render(RenderFrameData& render_frame_data, const Vec3& camera_position)
+{
+	PAW_PROFILER_FUNC();
+
+	preRenderTick(render_frame_data);
+	beginRender(render_frame_data);
+
+	/*
+	FrameData& frame_data = frame_datas[frame_index % Renderer::g_frames_in_flight];
+	VkCommandBuffer command_buffer = render_frame_data.command_buffer;
+
+	Gpu::pushDebugGroup(command_buffer, "Models");
+	{
+		PAW_GPU_PROFILER_ZONE("Models", command_buffer);
+		SceneConstants* scene_constants_ptr =
+			reinterpret_cast<SceneConstants*>(frame_data.scene_constants_buffer.map());
+		scene_constants_ptr->view_projection = camera_mat;
+		frame_data.scene_constants_buffer.unmap();
+
+		model_pipeline.bind(command_buffer);
+
+		const ModelPushConstants constants{
+			.object_constants_slot = frame_data.object_constants_buffer_slot,
+			.scene_constants_slot = frame_data.scene_constants_buffer_slot,
+		};
+
+		model_pipeline.pushConstants(command_buffer, &constants);
+
+		vkCmdBindIndexBuffer(command_buffer, Assets::pedestrian_mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+		vkCmdDrawIndexed(
+			command_buffer,
+			static_cast<u32>(Assets::pedestrian_mesh.index_count),
+			static_cast<u32>(anim_instances.size),
+			0,
+			0,
+			0);
+	}
+	Gpu::popDebugGroup(command_buffer);
+	*/
+
+	endRender(render_frame_data, camera_position);
+}
+
+void SceneRenderer::endRender(RenderFrameData& render_frame_data, const Vec3& camera_position)
+{
+	FrameData& frame_data = frame_datas[frame_index % Renderer::g_frames_in_flight];
+	VkCommandBuffer command_buffer = render_frame_data.command_buffer;
+	Gpu::pushDebugGroup(command_buffer, "Debug Geom");
+	{
+		PAW_GPU_PROFILER_ZONE("Debug Geom", command_buffer);
+
+		debug_pipeline.bind(command_buffer);
+
+		const DebugGeomConstants debug_geom_constants{
+			.view_projecion = camera_mat,
+			.lines_buffer_slot = line_data.line_buffer_slot,
+			.camera_position = camera_position,
+		};
+
+		debug_pipeline.pushConstants(command_buffer, &debug_geom_constants);
+
+		const u32 vert_count = static_cast<u32>(line_data.line_count) * 36;
+		vkCmdDraw(command_buffer, vert_count, 1, 0, 0);
+	}
+	Gpu::popDebugGroup(command_buffer);
+
+	Gpu::pushDebugGroup(command_buffer, "Gpu Debug Geom");
+	{
+		PAW_GPU_PROFILER_ZONE("Gpu Debug Geom", command_buffer);
+		Gfx::setBufferInShader(
+			gpu_line_data.line_buffer.buffer, 0, gpu_line_data.line_buffer.size, Gfx::g_debug_lines_slot);
+		Gfx::setBufferInShader(
+			gpu_line_data.draw_cmd_buffer.buffer, 0, gpu_line_data.draw_cmd_buffer.size, Gfx::g_debug_line_cmds_slot);
+
+		debug_pipeline.bind(command_buffer);
+
+		const DebugGeomConstants debug_geom_constants{
+			.view_projecion = camera_mat,
+			.lines_buffer_slot = gpu_line_data.line_buffer_slot,
+			.camera_position = camera_position,
+		};
+
+		debug_pipeline.pushConstants(command_buffer, &debug_geom_constants);
+
+		const VkBufferMemoryBarrier read_barriers[] = {
+			Gfx::bufferBarrier(
+				gpu_line_data.draw_cmd_buffer.buffer,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+				VK_ACCESS_INDIRECT_COMMAND_READ_BIT),
+			Gfx::bufferBarrier(
+				gpu_line_data.line_buffer.buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)};
+
+		vkCmdPipelineBarrier(
+			command_buffer,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+			0,
+			0,
+			nullptr,
+			PAW_ARRAY_COUNT(read_barriers),
+			read_barriers,
+			0,
+			nullptr);
+		vkCmdDrawIndirect(command_buffer, gpu_line_data.draw_cmd_buffer.buffer, 0, 1, sizeof(VkDrawIndirectCommand));
+	}
+	Gpu::popDebugGroup(command_buffer);
+
+	Gpu::pushDebugGroup(command_buffer, "Debug Geom No Depth");
+	{
+		PAW_GPU_PROFILER_ZONE("Debug Geom No Depth", command_buffer);
+		no_depth_debug_pipeline.bind(command_buffer);
+		const DebugGeomConstants debug_geom_constants{
+			.view_projecion = camera_mat,
+			.lines_buffer_slot = no_depth_line_data.line_buffer_slot,
+			.camera_position = camera_position,
+
+		};
+
+		no_depth_debug_pipeline.pushConstants(command_buffer, &debug_geom_constants);
+		const u32 vert_count = static_cast<u32>(no_depth_line_data.line_count) * 36;
+		vkCmdDraw(command_buffer, vert_count, 1, 0, 0);
+	}
+	Gpu::popDebugGroup(command_buffer);
+
+	Gpu::pushDebugGroup(command_buffer, "GUI");
+	{
+		PAW_GPU_PROFILER_ZONE("GUI", command_buffer);
+
+		gui_pipeline.bind(command_buffer);
+
+		const GuiConstants constants{
+			.projection = Mat4::ortho(0.0f, 0.0f, static_cast<f32>(width), static_cast<f32>(height), 0.0f, 100.0f),
+			.commands_buffer_index = frame_data.gui_commands_buffer_slot,
+			.sampler_index = font_sampler_index,
+		};
+
+		gui_pipeline.pushConstants(command_buffer, &constants);
+
+		// vkCmdDraw(command_buffer, 6, 1, 0, 0);
+		vkCmdDraw(command_buffer, static_cast<u32>(render_command_count) * 6, 1, 0, 0);
+	}
+	Gpu::popDebugGroup(command_buffer);
+
+	Gpu::pushDebugGroup(command_buffer, "Vector");
+	{
+		const f32 zoom_level = 1.0f;
+		vector_pipeline.bind(command_buffer);
+		const VectorConstants constants{
+			.projection = Mat4::ortho(
+				0.0f, 0.0f, static_cast<f32>(width) * zoom_level, static_cast<f32>(height) * zoom_level, 0.0f, 100.0f),
+			.vertex_buffer_index = swf_shape.vertex_buffer_slot,
+		};
+
+		vector_pipeline.pushConstants(command_buffer, &constants);
+		vkCmdBindIndexBuffer(command_buffer, swf_shape.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+		vkCmdDrawIndexed(command_buffer, swf_shape.index_count, 1, 0, 0, 0);
+	}
+	Gpu::popDebugGroup(command_buffer);
+	vkCmdEndRendering(command_buffer);
+
+	const VkImageMemoryBarrier image_memory_barrier{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		.image = frame_data.resolved_render_target.image,
+		.subresourceRange =
+			{
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+	};
+
+	vkCmdPipelineBarrier(
+		command_buffer,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0,
+		0,
+		nullptr,
+		0,
+		nullptr,
+		1,
+		&image_memory_barrier);
+
+	frame_index++;
+}
+
+u32 SceneRenderer::getFrameRenderTargetSlot()
+{
+	const FrameData& frame_data = frame_datas[frame_index % Renderer::g_frames_in_flight];
+	return frame_data.render_target_slot;
+}
+
+void SceneRenderer::addDebugLine(const Vec3& start, const Vec3& end, bool depth, const Vec4& color, f32 thickness)
+{
+	if (depth)
+	{
+		PAW_ASSERT(line_data.line_count < line_data.max_lines);
+		line_data.line_buffer_ptr[line_data.line_count++] = DebugGeomLine{
+			.color = color,
+			.start = start,
+			.end = end,
+			.thickness = thickness,
+		};
+	}
+	else
+	{
+		PAW_ASSERT(no_depth_line_data.line_count < no_depth_line_data.max_lines);
+		no_depth_line_data.line_buffer_ptr[no_depth_line_data.line_count++] = DebugGeomLine{
+			.color = color,
+			.start = start,
+			.end = end,
+			.thickness = thickness,
+		};
+	}
+}
+
+void SceneRenderer::DebugLineData::reset()
+{
+	line_count = 0;
+}
+
+void SceneRenderer::DebugLineData::deinit()
+{
+	vkFreeMemory(Gpu::device(), line_buffer.memory, nullptr);
+	vkDestroyBuffer(Gpu::device(), line_buffer.buffer, nullptr);
+}
+
+void SceneRenderer::GpuDebugLineData::reset(RenderFrameData& render_frame_data)
+{
+	VkCommandBuffer command_buffer = render_frame_data.command_buffer;
+
+	VkBufferMemoryBarrier barrier =
+		Gfx::bufferBarrier(draw_cmd_buffer.buffer, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	vkCmdPipelineBarrier(
+		command_buffer,
+		VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0,
+		0,
+		nullptr,
+		1,
+		&barrier,
+		0,
+		nullptr);
+
+	const VkBufferCopy copy{
+		.srcOffset = 0,
+		.dstOffset = 0,
+		.size = sizeof(VkDrawIndirectCommand),
+	};
+	vkCmdCopyBuffer(command_buffer, draw_cmd_staging_buffer.buffer, draw_cmd_buffer.buffer, 1, &copy);
+
+	barrier = Gfx::bufferBarrier(
+		draw_cmd_buffer.buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+	vkCmdPipelineBarrier(
+		command_buffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+		0,
+		0,
+		nullptr,
+		1,
+		&barrier,
+		0,
+		nullptr);
+}
+
+void SceneRenderer::GpuDebugLineData::init()
+{
+	const usize line_buffer_size = megabytes(2);
+
+	max_lines = (line_buffer_size / sizeof(DebugGeomLine)) - 1;
+	line_buffer = RenderUtils::createAndAllocateBuffer(
+		line_buffer_size,
+		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	line_buffer_slot = Gfx::pushBufferToShader(line_buffer.buffer, 0, line_buffer_size);
+	draw_cmd_buffer = RenderUtils::createAndAllocateBuffer(
+		sizeof(VkDrawIndirectCommand),
+		VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+			VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+	draw_cmd_staging_buffer = RenderUtils::createAndAllocateBuffer(
+		sizeof(VkDrawIndexedIndirectCommand),
+		VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	VkDrawIndirectCommand* ptr = reinterpret_cast<VkDrawIndirectCommand*>(draw_cmd_staging_buffer.map());
+	*ptr = VkDrawIndirectCommand{
+		.vertexCount = 0,
+		.instanceCount = 1,
+		.firstVertex = 0,
+		.firstInstance = 0,
+	};
+	draw_cmd_staging_buffer.unmap();
+}
+
+void SceneRenderer::GpuDebugLineData::deinit()
+{
+	vkFreeMemory(Gpu::device(), line_buffer.memory, nullptr);
+	vkDestroyBuffer(Gpu::device(), line_buffer.buffer, nullptr);
+	vkFreeMemory(Gpu::device(), draw_cmd_buffer.memory, nullptr);
+	vkDestroyBuffer(Gpu::device(), draw_cmd_buffer.buffer, nullptr);
+	vkFreeMemory(Gpu::device(), draw_cmd_staging_buffer.memory, nullptr);
+	vkDestroyBuffer(Gpu::device(), draw_cmd_staging_buffer.buffer, nullptr);
+}
+
+void SceneRenderer::pushGuiCommand(GuiRectRenderCommand&& command)
+{
+	PAW_ASSERT(render_command_count < render_commands.size);
+	render_commands[render_command_count++] = command;
+}

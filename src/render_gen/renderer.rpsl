@@ -1,0 +1,64 @@
+graphics node draw_triangle(rtv render_target : SV_Target0, dsv depth_target : SV_DepthStencil, float3 color, float one_over_aspect_ratio, float4x4 camera_projection);
+
+graphics node draw_imgui(rtv render_target : SV_Target0, srv game_color_rt, srv texture_acescg);
+
+graphics node aces_to_acescg(rtv render_target : SV_Target0, srv texture_aces);
+
+graphics node oetf(rtv render_target : SV_Target0, srv pre_tonemap_rt);
+
+graphics node display_map_sdr(rtv render_target : SV_Target0, srv input);
+
+graphics node display_map_hdr(rtv render_target : SV_Target0, srv input);
+
+export void main([readonly(present)] texture backbuffer, srv texture_aces, bool hdr, int2 in_game_viewport_size, float4x4 camera_projection, uint game_color_sample_count) 
+{
+	ResourceDesc backbuffer_desc = backbuffer.desc();
+
+	 
+
+	const int2 game_viewport_size = max(in_game_viewport_size, int2(1, 1));
+
+	texture game_color_rt = create_tex2d(RPS_FORMAT_R16G16B16A16_FLOAT, game_viewport_size.x, game_viewport_size.y, 1);
+		
+
+	texture game_color_rt_msaa = create_tex2d(RPS_FORMAT_R16G16B16A16_FLOAT, game_viewport_size.x, game_viewport_size.y, 2, 1, 1, game_color_sample_count);
+	texture game_depth_rt_msaa = create_tex2d(RPS_FORMAT_D32_FLOAT_S8X24_UINT, game_viewport_size.x, game_viewport_size.y, 2, 1, 1, game_color_sample_count);
+	float one_over_aspect_ratio = (float)game_viewport_size.x / (float)game_viewport_size.y;
+		
+	clear(game_color_rt_msaa, float4(0.33, 0.33, 0.33, 1.0));
+	// Reverse depth
+	clear(game_depth_rt_msaa, 0.0f, 0);
+
+	//draw_triangle(game_color_rt_msaa, game_depth_rt_msaa, float3(0.0, 20.5, 0.0), one_over_aspect_ratio, camera_projection);
+
+	texture game_color_rt_pre_display_map = create_tex2d(RPS_FORMAT_R16G16B16A16_FLOAT, game_viewport_size.x, game_viewport_size.y, 2);
+	resolve(game_color_rt_pre_display_map, uint2(0, 0), game_color_rt_msaa, uint2(0, 0), uint2(game_viewport_size.x, game_viewport_size.y), RPS_RESOLVE_MODE_AVERAGE);
+
+	display_map_hdr(game_color_rt, game_color_rt_pre_display_map);
+
+	/*
+	if(hdr) {
+	} else {
+		display_map_sdr(game_color_rt, game_color_rt_pre_display_map);
+	}
+	*/
+
+	/*
+	ResourceDesc texture_aces_desc = texture_aces.desc();
+
+	texture texture_acescg = create_tex2d(RPS_FORMAT_R32G32B32A32_FLOAT, texture_aces_desc.Width, texture_aces_desc.Height, 1);
+	aces_to_acescg(texture_acescg, texture_aces);
+	*/
+
+	
+	texture pre_oetf_rt = hdr ? create_tex2d(RPS_FORMAT_R16G16B16A16_FLOAT, backbuffer_desc.Width, backbuffer_desc.Height, 1) :  backbuffer;
+
+	clear(pre_oetf_rt, float4(0.33, 0.33, 0.33, 1.0));
+	draw_imgui(pre_oetf_rt, game_color_rt, null);
+
+	if(hdr) 
+	{
+		oetf(backbuffer, pre_oetf_rt);
+	}
+	
+}

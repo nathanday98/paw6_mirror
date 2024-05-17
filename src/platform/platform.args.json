@@ -1,0 +1,34 @@
+{
+  "FileVersion": 2,
+  "Id": "c0bac79a-f5b9-8d41-9f94-8ffb7d5b9a5b",
+  "Items": [
+    {
+      "Id": "cdc5de99-c92b-4156-be97-7deb67a2e2a6",
+      "Command": "/disable_gpu_debug"
+    },
+    {
+      "Id": "9695a42f-753c-4bcb-a01d-fbfcbdc6e349",
+      "Command": "/profiler_wait_for_connection"
+    },
+    {
+      "Id": "6d180f62-81e3-4fcf-88c3-55d5473865fc",
+      "Command": "/list_all_tests"
+    },
+    {
+      "Id": "b2c5a76f-5992-4517-88d8-c1fe05955da9",
+      "Command": "/test"
+    },
+    {
+      "Id": "853a2353-9385-4cd1-87b3-efbcd93c0675",
+      "Command": "/editor_mode"
+    },
+    {
+      "Id": "06fa8dbd-fda5-432f-b3d2-092e0bf925a7",
+      "Command": "/port 64605"
+    },
+    {
+      "Id": "394b049f-e849-4e1d-8382-714d2a5c472c",
+      "Command": "/on_laptop"
+    }
+  ]
+}

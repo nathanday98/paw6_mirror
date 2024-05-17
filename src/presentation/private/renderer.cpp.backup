@@ -1,0 +1,251 @@
+#include "renderer.h"
+
+#include <core/allocators/arena_allocator.h>
+#include <core/memory.h>
+#include <core/string.h>
+#include <core/log.h>
+#include <core/math.inl>
+#include <core/hash.h>
+
+#include <platform/platform.h>
+
+#include <mutex>
+#include <stb_image.h>
+#include <spirv_reflect.h>
+
+#include "profiler.h"
+#include "frame_times.h"
+#include "gpu_profiler.h"
+#include "transform.h"
+#include "gpu.h"
+#include "editor.h"
+#include "imgui_wrapper.h"
+#include "gfx.h"
+#include "swapchain.h"
+#include "allocators/persistent_allocator.h"
+
+struct LightCell
+{
+	Vec3 position;
+	Vec3 color;
+	f32 distance;
+};
+
+static struct Data
+{
+
+	Swapchain swapchain;
+
+	usize frame_index;
+	RenderFrameData frame_datas[Renderer::g_frames_in_flight];
+
+	VkFence images_in_flight_fences[Swapchain::max_images];
+
+	PipelineRef final_blit_pipeline;
+	PipelineRef main_pass_pipeline;
+
+	PipelineRef imgui_pipeline;
+	PipelineRef model_pipeline;
+	PipelineRef skin_pipeline;
+
+	u32 texture_slot;
+
+	VkSampler sampler;
+	u32 sampler_slot;
+
+	ImGuiState imgui;
+
+	bool minimized;
+} g_data{};
+
+void Renderer::init(Platform& platform, const GameStartupArgs& startup_args)
+{
+	PAW_PROFILER_FUNC();
+	Gpu::init(platform, startup_args);
+	Gfx::init();
+	g_data.swapchain.init(platform, nullptr);
+
+	VkCommandBuffer command_buffers[g_frames_in_flight];
+
+	Gpu::allocCommandBuffers(g_frames_in_flight, command_buffers);
+
+	for (usize frame_index = 0; frame_index < g_frames_in_flight; frame_index++)
+	{
+		RenderFrameData& frame_data = g_data.frame_datas[frame_index];
+		frame_data.command_buffer = command_buffers[frame_index];
+		VkSemaphoreCreateInfo semaphore_create_info{
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		};
+
+		{
+			VkResult result =
+				vkCreateSemaphore(Gpu::device(), &semaphore_create_info, 0, &frame_data.image_available_semaphore);
+			PAW_ASSERT(result == VK_SUCCESS);
+			PAW_ASSERT_UNUSED(result);
+		}
+
+		{
+			VkResult result =
+				vkCreateSemaphore(Gpu::device(), &semaphore_create_info, 0, &frame_data.render_finished_semaphore);
+			PAW_ASSERT(result == VK_SUCCESS);
+			PAW_ASSERT_UNUSED(result);
+		}
+
+		{
+			VkFenceCreateInfo fence_create_info{
+				.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+				.flags = VK_FENCE_CREATE_SIGNALED_BIT,
+			};
+
+			VkResult result = vkCreateFence(Gpu::device(), &fence_create_info, 0, &frame_data.in_flight_fence);
+			PAW_ASSERT(result == VK_SUCCESS);
+			PAW_ASSERT_UNUSED(result);
+		}
+	}
+
+	g_data.final_blit_pipeline = Gfx::createGraphicsPipeline(
+		platform,
+		"test"_str,
+		GraphicsPipelineDesc{
+			.name = "Final Blit"_str,
+			.cull_mode = VK_CULL_MODE_BACK_BIT,
+			.blend_state =
+				{
+					.enabled = false,
+				},
+			.depth_test = false,
+			.depth_write = false,
+			.color_format = Gpu::surfaceColorFormat().format,
+		});
+
+	{
+		VkPhysicalDeviceProperties device_properties;
+		vkGetPhysicalDeviceProperties(Gpu::physicalDevice(), &device_properties);
+
+		const VkSamplerCreateInfo create_info{
+			.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+			.magFilter = VK_FILTER_LINEAR,
+			.minFilter = VK_FILTER_LINEAR,
+			.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+			.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.mipLodBias = 0.0f,
+			.anisotropyEnable = VK_TRUE,
+			.maxAnisotropy = device_properties.limits.maxSamplerAnisotropy,
+			.compareEnable = VK_FALSE,
+			.compareOp = VK_COMPARE_OP_ALWAYS,
+			.minLod = 0.0f,
+			.maxLod = 0.0f,
+			.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+			.unnormalizedCoordinates = VK_FALSE,
+		};
+
+		VkResult result = vkCreateSampler(Gpu::device(), &create_info, 0, &g_data.sampler);
+		PAW_ASSERT(result == VK_SUCCESS);
+		PAW_ASSERT_UNUSED(result);
+
+		g_data.sampler_slot = Gfx::pushSamplerToShader(g_data.sampler);
+	}
+
+	g_data.imgui_pipeline.verifyStruct<ImDrawVert>("Vertex"_str);
+	g_data.imgui_pipeline.verifyPushConstants<ImGuiState::PushConstants>();
+
+	g_data.imgui.init();
+}
+
+static void recreateSwapchain(Platform& platform)
+{
+	vkDeviceWaitIdle(Gpu::device());
+	Swapchain new_swapchain;
+	new_swapchain.init(platform, &g_data.swapchain);
+
+	g_data.swapchain.deinit();
+	g_data.swapchain = new_swapchain;
+}
+
+void Renderer::deinit()
+{
+	vkDeviceWaitIdle(Gpu::device());
+
+	for (usize frame_index = 0; frame_index < g_frames_in_flight; frame_index++)
+	{
+		RenderFrameData& frame_data = g_data.frame_datas[frame_index];
+		vkDestroySemaphore(Gpu::device(), frame_data.image_available_semaphore, nullptr);
+		vkDestroySemaphore(Gpu::device(), frame_data.render_finished_semaphore, nullptr);
+		vkDestroyFence(Gpu::device(), frame_data.in_flight_fence, nullptr);
+	}
+
+	g_data.swapchain.deinit();
+
+	Gfx::deinit();
+	Gpu::deinit();
+}
+
+void Renderer::processEvent(const PlatformEvent& event)
+{
+	PAW_UNUSED_ARG(event);
+	// switch (event.type)
+	// {
+	// 	case SDL_WINDOWEVENT:
+	// 	{
+	// 		switch (event->window.event)
+	// 		{
+	// 			case SDL_WINDOWEVENT_MINIMIZED:
+	// 			{
+	// 				g_data.minimized = true;
+	// 			}
+	// 			break;
+
+	// 			case SDL_WINDOWEVENT_RESTORED:
+	// 			{
+	// 				g_data.minimized = false;
+	// 			}
+	// 			break;
+	// 		}
+	// 	}
+	// 	break;
+	// }
+}
+
+RenderFrameData& Renderer::prepareFrame(Platform& platform)
+{
+
+	Gpu::collectProfiler(frame_data.command_buffer);
+
+	return frame_data;
+}
+
+void Renderer::render(Platform& platform)
+{
+	PAW_PROFILER_FUNC();
+
+	// const time::HighResStamp start_time = time::getClockTime();
+	if (g_data.minimized)
+	{
+		return;
+	}
+
+	const RenderFrameData& frame_data = g_data.frame_datas[g_data.frame_index % g_frames_in_flight];
+
+	{
+
+		g_data.final_blit_pipeline.bind(frame_data.command_buffer);
+
+		g_data.imgui.render(frame_data.command_buffer);
+	}
+
+	if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+	{
+		ImGui::UpdatePlatformWindows();
+		ImGui::RenderPlatformWindowsDefault();
+	}
+
+	// FrameTimes::cpu_render_time_ms = time::getElapsedMillisecondsF32(start_time);
+}
+
+void Renderer::onShaderModification(Platform& platform, const ConstString& path)
+{
+	Gfx::requestRecompile(platform, path);
+}
+}

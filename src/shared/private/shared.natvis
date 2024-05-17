@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?> 
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+	<Type Name="Slice&lt;*&gt;">
+		<DisplayString>{{size={size} }}</DisplayString>
+		<Expand>
+			<ArrayItems>
+				<Size>size</Size>
+				<ValuePointer>ptr</ValuePointer>
+			</ArrayItems>
+		</Expand>
+	</Type>
+	<Type Name="StringID">
+		<Expand>
+			<CustomListItems>
+				<Variable Name="i" InitialValue="0"/>
+				<Loop Condition="i &lt; debug_values->hashes.size()">
+					<If Condition="debug_values->hashes[i] == value">
+						<Item Name="value">value,x</Item>
+						<Item Name="string">debug_values->strings[i], s</Item>
+						<Break/>
+					</If>
+					<Exec>i++</Exec>
+				</Loop>
+			</CustomListItems>
+		</Expand>
+	</Type>
+</AutoVisualizer>

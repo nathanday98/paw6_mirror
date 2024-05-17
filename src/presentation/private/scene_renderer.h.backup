@@ -1,0 +1,145 @@
+#pragma once
+
+#include <core/std.h>
+#include <core/math.h>
+
+#include "render_utils.h"
+#include "renderer.h"
+#include "gfx.h"
+#include "swf.h"
+
+struct DebugGeomLine
+{
+	Vec4 color;
+	Vec3 start;
+	Vec3 end;
+	f32 thickness;
+};
+
+struct GuiRectRenderCommand
+{
+	Vec2 min;
+	Vec2 max;
+	Vec2 min_uv;
+	Vec2 max_uv;
+	Vec4 color;
+	Vec2 clip_min;
+	Vec2 clip_max;
+	u32 texture_index;
+};
+
+struct ObjectConstants
+{
+	Mat4 model;
+	u32 vertex_buffer_slot;
+	u32 vertex_offset;
+	Vec3 color;
+};
+
+struct SceneRenderer
+{
+	void init(Platform& platform, usize width, usize height);
+	void deinit();
+	void beginFrame();
+	void resize(usize new_width, usize new_height);
+	void createRenderTargets();
+	void destroyRenderTargets();
+	virtual void preRenderTick(RenderFrameData& render_frame_data);
+	void beginRender(RenderFrameData& render_frame_data);
+	virtual void render(RenderFrameData& render_frame_data, const Vec3& camera_position);
+	void endRender(RenderFrameData& render_frame_data, const Vec3& camera_position);
+
+	u32 getFrameRenderTargetSlot();
+
+	// Debug
+	void addDebugLine(
+		const Vec3& start, const Vec3& end, bool depth = true, const Vec4& color = Vec4{1.0f, 1.0f, 1.0f, 1.0f},
+		f32 thickness = 0.025f);
+
+	void pushGuiCommand(GuiRectRenderCommand&& command);
+
+	struct FrameData
+	{
+		RenderUtils::AllocatedImage render_target;
+		VkImageView render_target_view;
+		RenderUtils::AllocatedImage resolved_render_target;
+		VkImageView resolved_render_target_view;
+		u32 render_target_slot;
+		RenderUtils::AllocatedImage depth_image;
+		VkImageView depth_image_view;
+		RenderUtils::AllocatedBuffer object_constants_buffer;
+		u32 object_constants_buffer_slot;
+		RenderUtils::AllocatedBuffer scene_constants_buffer;
+		u32 scene_constants_buffer_slot;
+		u32 gui_commands_buffer_slot;
+	};
+
+	struct DebugLineData
+	{
+		RenderUtils::AllocatedBuffer line_buffer;
+		usize line_count;
+		usize max_lines;
+		DebugGeomLine* line_buffer_ptr;
+		u32 line_buffer_slot;
+
+		void reset();
+		void init();
+		void deinit();
+	};
+
+	DebugLineData line_data;
+	DebugLineData no_depth_line_data;
+
+	struct GpuDebugLineData
+	{
+		RenderUtils::AllocatedBuffer line_buffer;
+		RenderUtils::AllocatedBuffer draw_cmd_buffer;
+		RenderUtils::AllocatedBuffer draw_cmd_staging_buffer;
+		usize max_lines;
+		u32 line_buffer_slot;
+
+		void reset(RenderFrameData& render_frame_data);
+		void init();
+		void deinit();
+	};
+
+	GpuDebugLineData gpu_line_data;
+
+	FrameData frame_datas[Renderer::g_frames_in_flight];
+	usize width;
+	usize height;
+
+	Slice<AnimInstance> anim_instances;
+	Slice<RenderPose> render_poses;
+	usize pose_transform_count;
+
+	RenderUtils::AllocatedBuffer pose_transforms_buffer;
+	u32 pose_transforms_buffer_slot;
+	RenderUtils::AllocatedBuffer skinned_vertex_buffer;
+	u32 skinned_vertex_buffer_slot;
+	RenderUtils::AllocatedBuffer object_constants_staging;
+	ObjectConstants* object_constants_staging_ptr;
+
+	PipelineRef model_pipeline;
+	PipelineRef skin_pipeline;
+
+	usize frame_index;
+
+	Mat4 camera_mat;
+
+	VkSampler font_sampler;
+	u32 font_sampler_index;
+
+	Slice<GuiRectRenderCommand> render_commands;
+	usize render_command_count = 0;
+
+	RenderUtils::AllocatedBuffer gui_commands_buffer;
+	GuiRectRenderCommand* gui_commands_buffer_ptr;
+
+	SwfShape swf_shape;
+
+	inline static PipelineRef debug_pipeline;
+	inline static PipelineRef no_depth_debug_pipeline;
+	inline static PipelineRef gui_pipeline;
+	inline static PipelineRef vector_pipeline;
+};
